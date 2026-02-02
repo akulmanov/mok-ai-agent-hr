@@ -1,0 +1,51 @@
+.dashboard-intro {
+  color: #666;
+  margin-bottom: 2rem;
+  line-height: 1.6;
+}
+
+.dashboard-actions {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 2rem;
+}
+
+.screenings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.screening-item {
+  display: block;
+  padding: 1rem;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  text-decoration: none;
+  color: inherit;
+  transition: all 0.3s;
+}
+
+.screening-item:hover {
+  border-color: #667eea;
+  transform: translateY(-2px);
+  box-shadow: 0 5px 15px rgba(102, 126, 234, 0.2);
+}
+
+.screening-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.screening-score {
+  font-weight: 600;
+  color: #667eea;
+}
+
+.screening-meta {
+  color: #999;
+  font-size: 0.875rem;
+}
