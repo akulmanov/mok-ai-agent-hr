@@ -5,18 +5,26 @@ import './Dashboard.css'
 
 function Dashboard() {
   const [screenings, setScreenings] = useState([])
+  const [positions, setPositions] = useState([])
+  const [candidates, setCandidates] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
   useEffect(() => {
-    loadScreenings()
+    loadData()
   }, [])
 
-  const loadScreenings = async () => {
+  const loadData = async () => {
     try {
       setLoading(true)
-      const data = await apiService.listScreenings({ limit: 10 })
-      setScreenings(Array.isArray(data) ? data : [])
+      const [screeningsData, positionsData, candidatesData] = await Promise.all([
+        apiService.listScreenings({ limit: 10 }),
+        apiService.listPositions({ limit: 1000 }),
+        apiService.listCandidates({ limit: 1000 })
+      ])
+      setScreenings(Array.isArray(screeningsData) ? screeningsData : [])
+      setPositions(Array.isArray(positionsData) ? positionsData : [])
+      setCandidates(Array.isArray(candidatesData) ? candidatesData : [])
     } catch (err) {
       setError(err.message)
     } finally {
@@ -37,6 +45,9 @@ function Dashboard() {
     }
   }
 
+  const openPositions = positions.filter(p => p.is_open).length
+  const closedPositions = positions.filter(p => !p.is_open).length
+
   return (
     <div className="dashboard">
       <div className="card">
@@ -46,15 +57,33 @@ function Dashboard() {
         </p>
 
         <div className="dashboard-actions">
-          <Link to="/job-posting" className="btn btn-primary">
-            Создать новую вакансию
+          <Link to="/positions" className="btn btn-primary">
+            Вакансии
           </Link>
-          <Link to="/upload-cv" className="btn btn-primary">
-            Загрузить резюме
+          <Link to="/cvs" className="btn btn-primary">
+            Резюме
           </Link>
           <Link to="/screening" className="btn btn-primary">
             Запустить отбор
           </Link>
+        </div>
+      </div>
+
+      <div className="stats">
+        <div className="stat-card">
+          <div className="stat-value">{positions.length}</div>
+          <div className="stat-label">Всего вакансий</div>
+          <div style={{ marginTop: '0.5rem', fontSize: '0.875rem', color: '#64748b' }}>
+            Открыто: {openPositions} | Закрыто: {closedPositions}
+          </div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-value">{candidates.length}</div>
+          <div className="stat-label">Всего кандидатов</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-value">{screenings.length}</div>
+          <div className="stat-label">Последних отборов</div>
         </div>
       </div>
 
@@ -66,7 +95,9 @@ function Dashboard() {
         {!loading && !error && (
           <>
             {screenings.length === 0 ? (
-              <p>Отборов пока нет. Создайте вакансию и загрузите резюме, чтобы начать.</p>
+              <p style={{ color: '#64748b', textAlign: 'center', padding: '2rem' }}>
+                Отборов пока нет. Создайте вакансию и загрузите резюме, чтобы начать.
+              </p>
             ) : (
               <div className="screenings-list">
                 {screenings.map((screening) => (
@@ -76,17 +107,18 @@ function Dashboard() {
                     className="screening-item"
                   >
                     <div className="screening-header">
-                      <span className={`badge ${getBadgeClass(screening.decision)}`}>
-                        {screening.decision === 'pass' ? 'ПРИНЯТ' : screening.decision === 'hold' ? 'НА РАССМОТРЕНИИ' : 'ОТКЛОНЕН'}
-                      </span>
-                      <span className="screening-score">
-                        Оценка: {(screening.score * 100).toFixed(1)}%
-                      </span>
+                      <strong>Отбор #{screening.version}</strong>
+                      <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                        <span className={`badge ${getBadgeClass(screening.decision)}`}>
+                          {screening.decision === 'pass' ? 'ПРИНЯТ' : screening.decision === 'hold' ? 'НА РАССМОТРЕНИИ' : 'ОТКЛОНЕН'}
+                        </span>
+                        <span className="screening-score">
+                          {(screening.score * 100).toFixed(1)}%
+                        </span>
+                      </div>
                     </div>
                     <div className="screening-meta">
                       <small>
-                        Кандидат: {screening.candidate_id?.substring(0, 8)}... | 
-                        Вакансия: {screening.position_id?.substring(0, 8)}... | 
                         {new Date(screening.created_at).toLocaleString('ru-RU')}
                       </small>
                     </div>

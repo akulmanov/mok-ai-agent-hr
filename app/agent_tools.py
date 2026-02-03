@@ -5,8 +5,7 @@ from app.models import Position, Candidate, Screening, Clarification
 from app.llm_service import LLMService
 from app.scoring import ScoringService
 from app.cv_parser import CVParser
-import os
-import aiofiles
+from app.true_agent import TrueAgent
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -23,7 +22,7 @@ class AgentTools:
     
     def create_position(self, raw_description: str) -> Position:
         """Create a position from raw job description."""
-        logger.info("Creating position from raw description")
+        logger.info("Создание вакансии из описания")
         
         # Extract structured data
         structured_data = self.llm.extract_job_requirements(raw_description)
@@ -38,7 +37,7 @@ class AgentTools:
         self.db.commit()
         self.db.refresh(position)
         
-        logger.info(f"Created position {position.id}")
+        logger.info(f"Создана вакансия {position.id}")
         return position
     
     def get_position(self, position_id: str) -> Optional[Position]:
@@ -51,7 +50,7 @@ class AgentTools:
         file_type: Optional[str] = None
     ) -> Candidate:
         """Create candidate from CV file."""
-        logger.info(f"Creating candidate from file: {file_path}")
+        logger.info(f"Создание кандидата из файла: {file_path}")
         
         # Parse CV
         cv_text = await self.cv_parser.parse_file(file_path, file_type)
@@ -74,7 +73,7 @@ class AgentTools:
         self.db.commit()
         self.db.refresh(candidate)
         
-        logger.info(f"Created candidate {candidate.id}")
+        logger.info(f"Создан кандидат {candidate.id}")
         return candidate
     
     def get_candidate(self, candidate_id: str) -> Optional[Candidate]:
@@ -89,13 +88,13 @@ class AgentTools:
         parent_screening_id: Optional[str] = None
     ) -> Screening:
         """Run evaluation and create screening record."""
-        logger.info(f"Running evaluation: candidate={candidate_id}, position={position_id}")
+        logger.info(f"Запуск оценки: кандидат={candidate_id}, вакансия={position_id}")
         
         candidate = self.get_candidate(candidate_id)
         position = self.get_position(position_id)
         
         if not candidate or not position:
-            raise ValueError("Candidate or position not found")
+            raise ValueError("Кандидат или вакансия не найдены")
         
         # Get requirements
         requirements = position.structured_data.get("requirements", [])
@@ -113,12 +112,15 @@ class AgentTools:
         # Extract strengths and gaps
         strengths_gaps = self.scoring.extract_strengths_and_gaps(evaluations)
         
-        # Generate clarification questions if needed
-        clarification_questions = self.llm.generate_clarification_questions(
-            requirements,
-            candidate.structured_profile,
-            evaluations
-        )
+        # Generate clarification questions ТОЛЬКО если решение "на рассмотрении"
+        # Для явного "проходите" или "не подходите" не мучаем кандидата вопросами.
+        clarification_questions: List[str] = []
+        if score_result["decision"] == "hold":
+            clarification_questions = self.llm.generate_clarification_questions(
+                requirements,
+                candidate.structured_profile,
+                evaluations
+            )
         
         # Generate interview questions
         interview_questions = self.llm.generate_interview_questions(
@@ -163,7 +165,7 @@ class AgentTools:
         self.db.commit()
         self.db.refresh(screening)
         
-        logger.info(f"Created screening {screening.id} with decision: {score_result['decision']}")
+        logger.info(f"Создан отбор {screening.id} с решением: {score_result['decision']}")
         return screening
     
     def add_clarification_answer(
@@ -192,12 +194,29 @@ class AgentTools:
         self,
         candidate_id: str,
         position_id: str,
-        max_iterations: int = 3
+        max_iterations: int = 3,
+        use_true_agent: bool = False
     ) -> Screening:
         """
         Run agent loop: evaluate, ask questions if needed, re-evaluate.
+        
+        Args:
+            candidate_id: ID of the candidate
+            position_id: ID of the position
+            max_iterations: Maximum number of iterations
+            use_true_agent: If True, use the TrueAgent with full autonomous capabilities
         """
-        logger.info(f"Starting agent loop: candidate={candidate_id}, position={position_id}")
+        if use_true_agent:
+            logger.info("🤖 Использование TrueAgent с полными автономными возможностями")
+            agent = TrueAgent(self.db, self.llm)
+            return agent.run_autonomous_screening(
+                candidate_id=candidate_id,
+                position_id=position_id,
+                max_iterations=max_iterations
+            )
+        
+        # Legacy simple agent loop
+        logger.info(f"Запуск простого цикла агента: кандидат={candidate_id}, вакансия={position_id}")
         
         screening = None
         parent_screening_id = None
@@ -213,20 +232,24 @@ class AgentTools:
             
             # Check if clarification is needed
             if not screening.clarification_questions or len(screening.clarification_questions) == 0:
-                logger.info("No clarification needed, agent loop complete")
+                logger.info("Уточнения не требуются, цикл агента завершен")
                 break
             
             # If we have questions but reached max iterations, stop
             if iteration >= max_iterations:
-                logger.info(f"Reached max iterations ({max_iterations}), stopping agent loop")
+                logger.info(f"Достигнуто максимальное количество итераций ({max_iterations}), остановка цикла агента")
                 break
             
             # In a real system, we'd wait for user answers here
             # For now, we'll just mark that questions were generated
-            logger.info(f"Iteration {iteration}: Generated {len(screening.clarification_questions)} clarification questions")
+            logger.info(f"Итерация {iteration}: Сгенерировано {len(screening.clarification_questions)} уточняющих вопросов")
             parent_screening_id = screening.id
         
         return screening
+    
+    def get_screening(self, screening_id: str) -> Optional[Screening]:
+        """Get screening by ID."""
+        return self.db.query(Screening).filter(Screening.id == screening_id).first()
     
     def find_matching_positions(
         self,
@@ -239,7 +262,7 @@ class AgentTools:
         """
         candidate = self.get_candidate(candidate_id)
         if not candidate:
-            raise ValueError("Candidate not found")
+            raise ValueError("Кандидат не найден")
         
         # Get all open positions
         open_positions = self.db.query(Position).filter(Position.is_open == True).all()
@@ -260,7 +283,7 @@ class AgentTools:
                     "screening_id": screening.id
                 })
             except Exception as e:
-                logger.error(f"Error evaluating position {position.id}: {e}")
+                logger.error(f"Ошибка при оценке вакансии {position.id}: {e}")
                 continue
         
         # Sort by score descending

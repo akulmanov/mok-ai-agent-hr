@@ -23,16 +23,36 @@ export const apiService = {
     return response.data
   },
 
-  // Candidates
-  uploadCV: async (file) => {
-    const formData = new FormData()
-    formData.append('file', file)
-    const response = await api.post('/candidates/upload', formData, {
-      headers: {
-        'Content-Type': 'multipart/form-data',
-      },
-    })
+  listPositions: async (params = {}) => {
+    const queryParams = new URLSearchParams(params).toString()
+    const response = await api.get(`/positions?${queryParams}`)
     return response.data
+  },
+
+  updatePosition: async (positionId, updates) => {
+    const response = await api.patch(`/positions/${positionId}`, updates)
+    return response.data
+  },
+
+  // Candidates
+  uploadCV: async (file = null, rawText = null) => {
+    if (file) {
+      const formData = new FormData()
+      formData.append('file', file)
+      const response = await api.post('/candidates/upload', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+      })
+      return response.data
+    } else if (rawText) {
+      const formData = new FormData()
+      formData.append('raw_text', rawText)
+      const response = await api.post('/candidates/upload', formData)
+      return response.data
+    } else {
+      throw new Error('Either file or rawText must be provided')
+    }
   },
 
   getCandidate: async (candidateId) => {
@@ -65,9 +85,15 @@ export const apiService = {
     return response.data
   },
 
-  // Agent mode
+  // Agent mode (simple)
   agentMode: async (request) => {
     const response = await api.post('/agent/screen', request)
+    return response.data
+  },
+
+  // True Agent mode (autonomous)
+  trueAgentMode: async (request) => {
+    const response = await api.post('/agent/true-agent', request)
     return response.data
   },
 
@@ -89,6 +115,17 @@ export const apiService = {
       channel,
       custom_message: customMessage
     })
+    return response.data
+  },
+
+  // Admin
+  clearAllData: async () => {
+    const response = await api.post('/admin/clear-data')
+    return response.data
+  },
+
+  generateSampleData: async () => {
+    const response = await api.post('/admin/generate-data')
     return response.data
   },
 }

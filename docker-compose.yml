@@ -44,6 +44,25 @@ services:
     networks:
       - hr-screening-network
 
+  telegram-bot:
+    build: .
+    container_name: hr-screening-telegram-bot
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/hr_screening.db}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+    command: python run_telegram_bot.py
+    depends_on:
+      - api
+    restart: unless-stopped
+    networks:
+      - hr-screening-network
+
 networks:
   hr-screening-network:
     driver: bridge

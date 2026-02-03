@@ -1,11 +1,14 @@
 import React, { useState } from 'react'
 import { BrowserRouter as Router, Routes, Route, Link } from 'react-router-dom'
-import JobPosting from './components/JobPosting'
-import CVUpload from './components/CVUpload'
+import Positions from './components/Positions'
+import PositionDetail from './components/PositionDetail'
+import CVs from './components/CVs'
 import Screening from './components/Screening'
 import Results from './components/Results'
 import Dashboard from './components/Dashboard'
 import Candidates from './components/Candidates'
+import CandidateDetail from './components/CandidateDetail'
+import Admin from './components/Admin'
 import './App.css'
 
 function App() {
@@ -20,9 +23,10 @@ function App() {
             <div className="nav-links">
               <Link to="/">Панель управления</Link>
               <Link to="/candidates">Кандидаты</Link>
-              <Link to="/job-posting">Создать вакансию</Link>
-              <Link to="/upload-cv">Загрузить резюме</Link>
+              <Link to="/positions">Вакансии</Link>
+              <Link to="/cvs">Резюме</Link>
               <Link to="/screening">Запустить отбор</Link>
+              <Link to="/admin">Администрирование</Link>
             </div>
           </div>
         </nav>
@@ -31,10 +35,13 @@ function App() {
           <Routes>
             <Route path="/" element={<Dashboard />} />
             <Route path="/candidates" element={<Candidates />} />
-            <Route path="/job-posting" element={<JobPosting />} />
-            <Route path="/upload-cv" element={<CVUpload />} />
+            <Route path="/candidates/:candidateId" element={<CandidateDetail />} />
+            <Route path="/positions" element={<Positions />} />
+            <Route path="/positions/:positionId" element={<PositionDetail />} />
+            <Route path="/cvs" element={<CVs />} />
             <Route path="/screening" element={<Screening />} />
             <Route path="/results/:screeningId" element={<Results />} />
+            <Route path="/admin" element={<Admin />} />
           </Routes>
         </main>
       </div>

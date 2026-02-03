@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     upload_dir: str = "./uploads"
     data_dir: str = "./data"
     
+    # Telegram Bot
+    telegram_bot_token: Optional[str] = None
+    telegram_webhook_url: Optional[str] = None
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

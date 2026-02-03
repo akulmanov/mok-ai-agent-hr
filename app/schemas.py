@@ -7,6 +7,10 @@ class PositionCreate(BaseModel):
     raw_description: str
 
 
+class PositionUpdate(BaseModel):
+    is_open: Optional[bool] = None
+
+
 class PositionResponse(BaseModel):
     id: str
     raw_description: str
@@ -20,6 +24,10 @@ class PositionResponse(BaseModel):
 
 class CandidateCreate(BaseModel):
     pass  # Created via file upload
+
+
+class CVUploadRequest(BaseModel):
+    raw_text: Optional[str] = None  # For text upload
 
 
 class CandidateResponse(BaseModel):
@@ -74,6 +82,15 @@ class AgentModeRequest(BaseModel):
     raw_job_description: Optional[str] = None
     candidate_id: Optional[str] = None
     max_iterations: int = 3
+    use_true_agent: bool = False  # Use the full autonomous TrueAgent
+
+
+class TrueAgentRequest(BaseModel):
+    position_id: Optional[str] = None
+    raw_job_description: Optional[str] = None
+    candidate_id: str
+    max_iterations: int = 10
+    goal: Optional[str] = None  # Custom goal for the agent
 
 
 class MatchPositionsResponse(BaseModel):
