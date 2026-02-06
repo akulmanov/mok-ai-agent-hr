@@ -7,8 +7,65 @@ from app.scoring import ScoringService
 from app.cv_parser import CVParser
 from app.true_agent import TrueAgent
 from pathlib import Path
+import math
 
 logger = logging.getLogger(__name__)
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return -1.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    denom = math.sqrt(na) * math.sqrt(nb)
+    if denom == 0.0:
+        return -1.0
+    return dot / denom
+
+def _build_position_match_text(position: Position) -> str:
+    sd = position.structured_data or {}
+    title = sd.get("title", "") or ""
+    summary = sd.get("summary", "") or ""
+    reqs = sd.get("requirements", []) or []
+    # Keep it compact; embeddings work well with concise, relevant text.
+    req_lines = []
+    for r in reqs[:25]:
+        text = (r or {}).get("text", "")
+        cat = (r or {}).get("category", "")
+        if text:
+            req_lines.append(f"[{cat}] {text}".strip())
+    return "\n".join([f"TITLE: {title}", f"SUMMARY: {summary}", "REQUIREMENTS:", *req_lines]).strip()
+
+def _build_candidate_match_text(candidate: Candidate) -> str:
+    prof = candidate.structured_profile or {}
+    summary = prof.get("summary", "") or ""
+    skills = prof.get("skills", []) or []
+    exp = prof.get("experience", []) or []
+    exp_lines = []
+    for e in exp[:10]:
+        role = (e or {}).get("role", "")
+        company = (e or {}).get("company", "")
+        desc = (e or {}).get("description", "")
+        line = " | ".join([p for p in [role, company] if p])
+        if desc:
+            line = f"{line}: {desc}" if line else desc
+        if line:
+            exp_lines.append(line)
+    skills_line = ", ".join([s for s in skills[:40] if isinstance(s, str)])
+    # Use a slice of raw text as extra signal (but keep token/cost bounded)
+    raw = (candidate.raw_cv_text or "")[:2000]
+    return "\n".join([
+        f"SUMMARY: {summary}",
+        f"SKILLS: {skills_line}",
+        "EXPERIENCE:",
+        *exp_lines,
+        "RAW:",
+        raw
+    ]).strip()
 
 
 class AgentTools:
@@ -26,6 +83,14 @@ class AgentTools:
         
         # Extract structured data
         structured_data = self.llm.extract_job_requirements(raw_description)
+
+        # Pre-compute embedding for matching (store inside JSON to avoid DB migrations)
+        try:
+            match_text = _build_position_match_text(Position(raw_description=raw_description, structured_data=structured_data, is_open=True))
+            structured_data["_match_text"] = match_text
+            structured_data["_match_embedding"] = self.llm.embed_text(match_text)
+        except Exception as e:
+            logger.warning(f"Не удалось вычислить embedding для вакансии: {e}")
         
         position = Position(
             raw_description=raw_description,
@@ -57,6 +122,13 @@ class AgentTools:
         
         # Extract structured profile
         structured_profile = self.llm.extract_candidate_profile(cv_text)
+
+        # Pre-compute embedding for matching (store inside JSON to avoid DB migrations)
+        try:
+            # We'll temporarily create a Candidate-like container by passing raw text + profile after Candidate creation below.
+            structured_profile["_match_text"] = ""  # filled after candidate instantiation
+        except Exception:
+            pass
         
         # Determine file type
         if file_type is None:
@@ -68,6 +140,15 @@ class AgentTools:
             cv_file_type=file_type,
             structured_profile=structured_profile
         )
+
+        try:
+            match_text = _build_candidate_match_text(candidate)
+            prof = candidate.structured_profile or {}
+            prof["_match_text"] = match_text
+            prof["_match_embedding"] = self.llm.embed_text(match_text)
+            candidate.structured_profile = prof
+        except Exception as e:
+            logger.warning(f"Не удалось вычислить embedding для кандидата: {e}")
         
         self.db.add(candidate)
         self.db.commit()
@@ -258,21 +339,20 @@ class AgentTools:
     ) -> List[Dict[str, Any]]:
         """
         Find top N matching positions for a candidate.
-        Simple implementation: evaluate against all open positions.
+        Uses fast embedding-based retrieval to select top-N positions, then runs full evaluation only on those.
         """
         candidate = self.get_candidate(candidate_id)
         if not candidate:
             raise ValueError("Кандидат не найден")
-        
-        # Get all open positions
-        open_positions = self.db.query(Position).filter(Position.is_open == True).all()
-        
-        if not open_positions:
+
+        # Retrieve top positions (fast)
+        positions_to_check = self.retrieve_top_positions_for_candidate(candidate_id, top_n=top_n)
+        if not positions_to_check:
             return []
-        
-        # Evaluate against each position
+
+        # Evaluate only retrieved positions (expensive)
         matches = []
-        for position in open_positions:
+        for position in positions_to_check:
             try:
                 screening = self.run_evaluation(candidate_id, position.id, version=1)
                 matches.append({
@@ -290,3 +370,47 @@ class AgentTools:
         matches.sort(key=lambda x: x["score"], reverse=True)
         
         return matches[:top_n]
+
+    def retrieve_top_positions_for_candidate(self, candidate_id: str, top_n: int = 5) -> List[Position]:
+        """
+        Fast retrieval: compute cosine similarity between candidate embedding and each open position embedding.
+        Embeddings are cached inside JSON fields:
+          - Candidate.structured_profile['_match_embedding']
+          - Position.structured_data['_match_embedding']
+        """
+        candidate = self.get_candidate(candidate_id)
+        if not candidate:
+            raise ValueError("Кандидат не найден")
+
+        open_positions = self.db.query(Position).filter(Position.is_open == True).all()
+        if not open_positions:
+            return []
+
+        # Ensure candidate embedding exists
+        prof = candidate.structured_profile or {}
+        cand_emb = prof.get("_match_embedding")
+        if not cand_emb:
+            match_text = _build_candidate_match_text(candidate)
+            prof["_match_text"] = match_text
+            prof["_match_embedding"] = self.llm.embed_text(match_text)
+            candidate.structured_profile = prof
+            self.db.commit()
+            cand_emb = prof["_match_embedding"]
+
+        scored: List[tuple[float, Position]] = []
+        for pos in open_positions:
+            sd = pos.structured_data or {}
+            pos_emb = sd.get("_match_embedding")
+            if not pos_emb:
+                match_text = _build_position_match_text(pos)
+                sd["_match_text"] = match_text
+                sd["_match_embedding"] = self.llm.embed_text(match_text)
+                pos.structured_data = sd
+                self.db.commit()
+                pos_emb = sd["_match_embedding"]
+
+            sim = _cosine_similarity(cand_emb, pos_emb)
+            scored.append((sim, pos))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [p for _, p in scored[:top_n]]

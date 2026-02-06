@@ -13,6 +13,7 @@ import logging
 import os
 import tempfile
 import asyncio
+import json
 from typing import Dict, Optional, List
 from datetime import datetime
 
@@ -32,6 +33,7 @@ from app.database import get_db, SessionLocal
 from app.models import Candidate, Position, Screening, Clarification
 from app.agent_tools import AgentTools
 from app.true_agent import TrueAgent
+from app.cv_parser import CVParser
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -134,12 +136,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Отменить текущую операцию."""
+    user_id = update.effective_user.id
+    session = get_user_session(user_id)
+    session['waiting_for_cv'] = False
     await update.message.reply_text("Операция отменена.")
     return ConversationHandler.END
 
 
 async def handle_cv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработчик команды /cv."""
+    # Установить флаг ожидания CV
+    user_id = update.effective_user.id
+    session = get_user_session(user_id)
+    session['waiting_for_cv'] = True
+    
     await update.message.reply_text(
         "📄 Отправьте ваше резюме:\n\n"
         "• Текстом (просто напишите резюме)\n"
@@ -149,15 +159,18 @@ async def handle_cv_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return WAITING_FOR_CV_TEXT
 
 
-async def handle_cv_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка текстового резюме."""
+async def process_cv_text(update: Update, context: ContextTypes.DEFAULT_TYPE, cv_text: str, db: Optional[Session] = None) -> None:
+    """Обработать текст резюме."""
     user_id = update.effective_user.id
-    cv_text = update.message.text
+    close_db = False
     
-    await update.message.reply_text("⏳ Обрабатываю ваше резюме...")
+    if db is None:
+        db = SessionLocal()
+        close_db = True
     
-    db = SessionLocal()
     try:
+        await update.message.reply_text("⏳ Обрабатываю ваше резюме...")
+        
         tools = AgentTools(db)
         
         # Сохранить текст во временный файл
@@ -183,13 +196,82 @@ async def handle_cv_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Проверить совместимость с вакансиями
         await check_compatibility(update, context, candidate.id, db)
         
-        return ConversationHandler.END
     except Exception as e:
         logger.error(f"Ошибка при обработке резюме: {e}")
         await update.message.reply_text(
             f"❌ Ошибка при обработке резюме: {str(e)}\n\n"
             "Попробуйте еще раз или используйте /help для справки."
         )
+    finally:
+        if close_db:
+            db.close()
+
+
+async def process_cv_file(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_path: str,
+    file_ext: str,
+    db: Optional[Session] = None
+) -> None:
+    """Обработать файл (PDF/DOCX/TXT) и, если это резюме, создать кандидата и запустить проверку."""
+    user_id = update.effective_user.id
+    close_db = False
+
+    if db is None:
+        db = SessionLocal()
+        close_db = True
+
+    try:
+        tools = AgentTools(db)
+
+        await update.message.reply_text("⏳ Проверяю содержимое файла...")
+
+        parser = CVParser()
+        extracted_text = await parser.parse_file(file_path, file_ext)
+
+        is_cv = tools.llm.is_cv_content(extracted_text)
+        if not is_cv:
+            await update.message.reply_text(
+                "❌ Похоже, это не резюме (CV).\n\n"
+                "Если вы хотите загрузить резюме, отправьте файл с резюме или используйте /cv."
+            )
+            return
+
+        await update.message.reply_text("⏳ Обрабатываю ваше резюме...")
+
+        candidate = await tools.create_candidate_from_file(file_path, file_ext)
+
+        session = get_user_session(user_id)
+        session['candidate_id'] = candidate.id
+        session['waiting_for_cv'] = False
+
+        # Обновить профиль с Telegram данными
+        profile = candidate.structured_profile or {}
+        profile['telegram'] = f"@{update.effective_user.username}" if update.effective_user.username else None
+        profile['telegram_id'] = str(user_id)
+        candidate.structured_profile = profile
+        db.commit()
+
+        await check_compatibility(update, context, candidate.id, db)
+
+    except Exception as e:
+        logger.error(f"Ошибка при обработке файла: {e}")
+        await update.message.reply_text(
+            f"❌ Ошибка при обработке файла: {str(e)}\n\n"
+            "Попробуйте еще раз или используйте /help для справки."
+        )
+    finally:
+        if close_db:
+            db.close()
+
+
+async def handle_cv_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Обработка текстового резюме (для conversation handler)."""
+    cv_text = update.message.text
+    db = SessionLocal()
+    try:
+        await process_cv_text(update, context, cv_text, db)
         return ConversationHandler.END
     finally:
         db.close()
@@ -204,6 +286,15 @@ async def handle_cv_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Пожалуйста, отправьте файл.")
         return WAITING_FOR_CV_TEXT
     
+    # Если вызывается из conversation handler, мы уже в правильном состоянии
+    # Но проверим флаг для ясности
+    session = get_user_session(user_id)
+    if not session.get('waiting_for_cv'):
+        # Если файл отправлен, но флаг не установлен, возможно это вне conversation
+        # Но так как мы удалили глобальный обработчик файлов, это не должно происходить
+        # Установим флаг и продолжим (на случай если что-то пошло не так)
+        session['waiting_for_cv'] = True
+    
     # Проверить тип файла
     file_ext = document.file_name.split('.')[-1].lower() if document.file_name else ''
     if file_ext not in ['pdf', 'docx', 'txt']:
@@ -214,38 +305,19 @@ async def handle_cv_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return WAITING_FOR_CV_TEXT
     
-    await update.message.reply_text("⏳ Загружаю и обрабатываю файл...")
-    
     try:
         # Скачать файл
         file = await context.bot.get_file(document.file_id)
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}')
         await file.download_to_drive(temp_file.name)
         temp_file.close()
-        
-        db = SessionLocal()
+
+        await process_cv_file(update, context, temp_file.name, file_ext)
+
         try:
-            tools = AgentTools(db)
-            
-            # Создать кандидата
-            candidate = await tools.create_candidate_from_file(temp_file.name, file_ext)
             os.unlink(temp_file.name)
-            
-            # Сохранить в сессию
-            session = get_user_session(user_id)
-            session['candidate_id'] = candidate.id
-            
-            # Обновить профиль с Telegram данными
-            profile = candidate.structured_profile or {}
-            profile['telegram'] = f"@{update.effective_user.username}" if update.effective_user.username else None
-            profile['telegram_id'] = str(user_id)
-            candidate.structured_profile = profile
-            db.commit()
-            
-            # Проверить совместимость с вакансиями
-            await check_compatibility(update, context, candidate.id, db)
-        finally:
-            db.close()
+        except Exception:
+            pass
         
         return ConversationHandler.END
         
@@ -258,6 +330,95 @@ async def handle_cv_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return ConversationHandler.END
 
 
+async def find_best_matching_positions(candidate, positions: List[Position], tools: AgentTools, top_n: int = 5) -> List[Position]:
+    """
+    Использовать LLM для определения наиболее подходящих позиций для кандидата.
+    Не использует жестко заданные категории, а анализирует совместимость через LLM.
+    """
+    if not positions or not candidate or not candidate.structured_profile:
+        return positions[:top_n] if positions else []
+    
+    profile = candidate.structured_profile
+    
+    # Собрать информацию о кандидате
+    candidate_info = {
+        "summary": profile.get('summary', ''),
+        "experience": profile.get('experience', []),
+        "skills": profile.get('skills', [])
+    }
+    
+    # Собрать информацию о позициях
+    positions_info = []
+    for pos in positions:
+        title = pos.structured_data.get('title', '') if pos.structured_data else ''
+        requirements = pos.structured_data.get('requirements', []) if pos.structured_data else []
+        positions_info.append({
+            "id": pos.id,
+            "title": title,
+            "requirements": [req.get('text', '') for req in requirements[:10]]  # Первые 10 требований
+        })
+    
+    # Использовать LLM для ранжирования позиций
+    system_prompt = """Вы HR-специалист, который определяет, какие вакансии наиболее подходят кандидату на основе их опыта и навыков.
+
+Проанализируйте профиль кандидата и список вакансий. Верните JSON массив с ID позиций, отсортированных по релевантности (от наиболее подходящих к наименее подходящим).
+
+Верните ТОЛЬКО JSON массив строк с ID позиций в порядке релевантности:
+["position_id_1", "position_id_2", ...]"""
+
+    candidate_str = f"""
+Кандидат:
+Резюме: {candidate_info['summary']}
+Опыт: {', '.join([exp.get('role', '') for exp in candidate_info['experience'][:3]])}
+Навыки: {', '.join(candidate_info['skills'][:20])}
+"""
+
+    positions_str = "\n".join([
+        f"ID: {p['id']}, Название: {p['title']}, Требования: {', '.join(p['requirements'][:5])}"
+        for p in positions_info
+    ])
+    
+    user_prompt = f"""{candidate_str}
+
+Вакансии:
+{positions_str}
+
+Верните JSON массив ID позиций в порядке релевантности (от наиболее подходящих)."""
+
+    try:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        response = tools.llm._call_llm(messages, response_format={"type": "json_object"})
+        result = json.loads(response)
+        
+        # Извлечь отсортированные ID
+        sorted_ids = result.get("positions", []) if isinstance(result, dict) else result if isinstance(result, list) else []
+        
+        # Создать словарь позиций по ID
+        positions_dict = {pos.id: pos for pos in positions}
+        
+        # Отсортировать позиции согласно LLM ранжированию
+        sorted_positions = []
+        for pos_id in sorted_ids:
+            if pos_id in positions_dict:
+                sorted_positions.append(positions_dict[pos_id])
+        
+        # Добавить позиции, которые LLM не вернул (на случай если что-то пропустил)
+        for pos in positions:
+            if pos.id not in sorted_ids:
+                sorted_positions.append(pos)
+        
+        return sorted_positions[:top_n]
+        
+    except Exception as e:
+        logger.error(f"Ошибка при ранжировании позиций через LLM: {e}")
+        # Fallback: вернуть все позиции
+        return positions[:top_n]
+
+
 async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE, candidate_id: str, db: Optional[Session] = None) -> None:
     """Проверить совместимость кандидата с открытыми вакансиями."""
     if db is None:
@@ -268,6 +429,11 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     try:
         tools = AgentTools(db)
+        candidate = tools.get_candidate(candidate_id)
+        
+        if not candidate:
+            await update.message.reply_text("❌ Кандидат не найден.")
+            return
         
         # Найти открытые вакансии
         open_positions = db.query(Position).filter(Position.is_open == True).all()
@@ -280,14 +446,22 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
         
+        # Быстрый отбор top-K позиций через embeddings (кешируется в БД внутри JSON)
+        await update.message.reply_text("⏳ Подбираю наиболее релевантные вакансии...")
+        try:
+            positions_to_check = tools.retrieve_top_positions_for_candidate(candidate_id, top_n=5)
+        except Exception as e:
+            logger.error(f"Ошибка при подборе релевантных вакансий: {e}")
+            positions_to_check = open_positions[:5]
+        
         await update.message.reply_text(
-            f"✅ Резюме загружено! Проверяю совместимость с {len(open_positions)} вакансиями...\n\n"
+            f"✅ Резюме загружено! Проверяю совместимость с {len(positions_to_check)} вакансиями...\n\n"
             "⏳ Это может занять некоторое время..."
         )
         
         # Проверить совместимость с каждой вакансией
         matches = []
-        for position in open_positions[:5]:  # Ограничим до 5 для скорости
+        for position in positions_to_check:
             try:
                 # Использовать TrueAgent для проверки
                 agent = TrueAgent(db, tools.llm)
@@ -334,7 +508,7 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
             decision_text = {
                 'pass': 'ПОДХОДИТЕ',
                 'hold': 'НА РАССМОТРЕНИИ',
-                'reject': 'НЕ ПОДХОДИТЕ'
+                'reject': 'Мы свяжемся с вами позже'
             }.get(screening.decision, 'НЕИЗВЕСТНО')
             
             result_text += f"{i}. {title}\n"
@@ -454,38 +628,56 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 if clar and clar.answer:
                     answers[q] = clar.answer
             
-            # Обработать ответы через TrueAgent
+            # Обработать ответы через TrueAgent и обновить профиль
             if answers:
-                agent._tool_process_answers(candidate_id, answers)
+                # 1) Обновить structured_profile кандидата на основе ответов
+                agent._tool_process_answers(candidate_id, answers, screening_id)
+
+                # 2) Переоценить кандидата для этой же вакансии (создаст новую версию отбора)
+                reeval_result = agent._tool_reevaluate(
+                    candidate_id=candidate_id,
+                    position_id=position_id,
+                    previous_screening_id=screening_id
+                )
+
+                if not reeval_result.get("success"):
+                    logger.error(f"Ошибка при переоценке: {reeval_result}")
+                    await update.message.reply_text(
+                        "❌ Не удалось выполнить повторную оценку после ответов.\n"
+                        "Попробуйте позже или свяжитесь с HR."
+                    )
+                else:
+                    # Получить обновленный Screening из БД, чтобы отобразить точные данные
+                    new_screening_id = reeval_result.get("screening_id")
+                    db_screening = db.query(Screening).filter(Screening.id == new_screening_id).first()
+                    screening_obj = db_screening or new_screening_id
+
+                    # Обновить текущий screening в сессии
+                    session['current_screening'] = new_screening_id
+
+                    decision = reeval_result.get("decision") or (db_screening.decision if db_screening else None)
+                    score = reeval_result.get("score") if isinstance(reeval_result.get("score"), (int, float)) else (db_screening.score if db_screening else 0.0)
+
+                    decision_emoji = {
+                        'pass': '✅',
+                        'hold': '⏳',
+                        'reject': '❌'
+                    }.get(decision, '❓')
+                    
+                    decision_text = {
+                        'pass': 'ПОДХОДИТЕ',
+                        'hold': 'НА РАССМОТРЕНИИ',
+                        'reject': 'Мы свяжемся с вами позже'
+                    }.get(decision, 'НЕИЗВЕСТНО')
+                    
+                    await update.message.reply_text(
+                        f"📊 **Обновленный результат (версия {reeval_result.get('version', '?')}):**\n\n"
+                        f"{decision_emoji} {decision_text}\n"
+                        f"Оценка: {score*100:.1f}%\n\n"
+                        f"Используйте /stats для просмотра всех версий отбора и подробностей."
+                    )
             
-            # Переоценить
-            new_screening = agent.run_autonomous_screening(
-                candidate_id=candidate_id,
-                position_id=position_id,
-                max_iterations=2
-            )
-            
-            # Показать результат
-            decision_emoji = {
-                'pass': '✅',
-                'hold': '⏳',
-                'reject': '❌'
-            }.get(new_screening.decision, '❓')
-            
-            decision_text = {
-                'pass': 'ПОДХОДИТЕ',
-                'hold': 'НА РАССМОТРЕНИИ',
-                'reject': 'НЕ ПОДХОДИТЕ'
-            }.get(new_screening.decision, 'НЕИЗВЕСТНО')
-            
-            await update.message.reply_text(
-                f"📊 **Обновленный результат:**\n\n"
-                f"{decision_emoji} {decision_text}\n"
-                f"Оценка: {new_screening.score*100:.1f}%\n\n"
-                f"Используйте /stats для подробной информации."
-            )
-            
-            # Очистить сессию
+            # Очистить сессию по вопросам
             session['pending_questions'] = []
             session['current_question_index'] = 0
             
@@ -611,7 +803,7 @@ async def check_position_compatibility(update: Update, context: ContextTypes.DEF
         decision_text = {
             'pass': 'ПОДХОДИТЕ',
             'hold': 'НА РАССМОТРЕНИИ',
-            'reject': 'НЕ ПОДХОДИТЕ'
+            'reject': 'Мы свяжемся с вами позже'
         }.get(screening.decision, 'НЕИЗВЕСТНО')
         
         text = f"📊 **Результат проверки:**\n\n"
@@ -720,8 +912,35 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif text == "❓ Помощь":
         await help_command(update, context)
     else:
-        # Если это просто текст, попробуем обработать как резюме
-        await handle_cv_text(update, context)
+        # Использовать LLM для проверки, является ли текст резюме
+        await update.message.reply_text("⏳ Проверяю, является ли это резюме...")
+        
+        db = SessionLocal()
+        try:
+            tools = AgentTools(db)
+            is_cv = tools.llm.is_cv_content(text)
+            
+            if is_cv:
+                # Это резюме, обработать его
+                await process_cv_text(update, context, text, db)
+            else:
+                # Это не резюме, показать помощь
+                await update.message.reply_text(
+                    "Я не понимаю эту команду. Используйте кнопки ниже или команды:\n\n"
+                    "/cv - Загрузить резюме\n"
+                    "/positions - Просмотр вакансий\n"
+                    "/stats - Моя статистика\n"
+                    "/help - Справка"
+                )
+        except Exception as e:
+            logger.error(f"Ошибка при проверке текста: {e}")
+            await update.message.reply_text(
+                "❌ Ошибка при обработке сообщения. Попробуйте использовать команды:\n\n"
+                "/cv - Загрузить резюме\n"
+                "/help - Справка"
+            )
+        finally:
+            db.close()
 
 
 def create_bot_application() -> Application:
@@ -739,11 +958,10 @@ def create_bot_application() -> Application:
     application.add_handler(CommandHandler("positions", show_positions))
     application.add_handler(CommandHandler("stats", show_stats))
     
-    # Conversation для загрузки CV
+    # Conversation для загрузки CV (через команду /cv)
     cv_conversation = ConversationHandler(
         entry_points=[
-            CommandHandler("cv", handle_cv_command),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cv_text)
+            CommandHandler("cv", handle_cv_command)
         ],
         states={
             WAITING_FOR_CV_TEXT: [
@@ -755,8 +973,43 @@ def create_bot_application() -> Application:
     )
     application.add_handler(cv_conversation)
     
-    # Обработчик файлов (вне conversation)
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_cv_file))
+    # Обработчик файлов (для файлов, отправленных вне conversation)
+    async def handle_file_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработчик файлов, отправленных вне conversation."""
+        document = update.message.document
+        if not document:
+            return
+        
+        file_ext = document.file_name.split('.')[-1].lower() if document.file_name else ''
+        if file_ext not in ['pdf', 'docx', 'txt']:
+            await update.message.reply_text(
+                "❌ Неподдерживаемый формат файла.\n\n"
+                "Поддерживаются: PDF, DOCX, TXT"
+            )
+            return
+        
+        try:
+            # Скачать файл
+            file = await context.bot.get_file(document.file_id)
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_ext}')
+            await file.download_to_drive(temp_file.name)
+            temp_file.close()
+            
+            # Обработать файл
+            await process_cv_file(update, context, temp_file.name, file_ext)
+            
+            # Удалить временный файл
+            try:
+                os.unlink(temp_file.name)
+            except:
+                pass
+        except Exception as e:
+            logger.error(f"Ошибка при обработке файла: {e}")
+            await update.message.reply_text(
+                f"❌ Ошибка при обработке файла: {str(e)}"
+            )
+    
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_file_message))
     
     # Обработчик кнопок
     application.add_handler(CallbackQueryHandler(button_handler))

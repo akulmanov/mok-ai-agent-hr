@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: Optional[str] = None
     openai_model: str = "gpt-4o"  # or "gpt-4-turbo" or "gpt-3.5-turbo"
+    openai_embedding_model: str = "text-embedding-3-small"
     
     # Scoring
     scoring_threshold: float = 0.65

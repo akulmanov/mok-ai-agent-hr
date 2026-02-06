@@ -16,7 +16,23 @@ class LLMService:
             raise ValueError("OPENAI_API_KEY must be set")
         self.client = OpenAI(api_key=settings.openai_api_key)
         self.model = settings.openai_model
+        self.embedding_model = getattr(settings, "openai_embedding_model", "text-embedding-3-small")
         self.temperature = 0.2  # Low temperature for consistency
+
+    def embed_text(self, text: str) -> List[float]:
+        """
+        Create an embedding vector for a piece of text.
+        Uses OpenAI Embeddings API (cheap + deterministic), suitable for similarity search.
+        """
+        try:
+            resp = self.client.embeddings.create(
+                model=self.embedding_model,
+                input=text
+            )
+            return resp.data[0].embedding
+        except Exception as e:
+            logger.error(f"Embedding API call failed: {e}")
+            raise
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _call_llm(self, messages: List[Dict], response_format: Optional[Dict] = None) -> str:
@@ -169,6 +185,62 @@ class LLMService:
                 "skills": [],
                 "summary": ""
             }
+    
+    def is_cv_content(self, content: str, max_length: int = 2000) -> bool:
+        """
+        Check if the given content is a CV/resume.
+        
+        Args:
+            content: Text content to check (can be truncated for efficiency)
+            max_length: Maximum length of content to send to LLM (to save tokens)
+        
+        Returns:
+            True if content appears to be a CV/resume, False otherwise
+        """
+        # Truncate if too long (just check beginning)
+        content_to_check = content[:max_length] if len(content) > max_length else content
+        
+        system_prompt = """Вы помощник HR-бота. Ваша задача - определить, является ли предоставленный текст резюме (CV) кандидата.
+
+Резюме обычно содержит:
+- Личную информацию (имя, контакты)
+- Опыт работы (должности, компании, даты)
+- Образование
+- Навыки и компетенции
+- Профессиональное резюме/описание
+
+Обычные сообщения пользователей НЕ являются резюме.
+
+Верните ТОЛЬКО JSON объект с одним полем:
+{
+    "is_cv": true или false
+}"""
+
+        user_prompt = f"""Определите, является ли этот текст резюме (CV):
+
+{content_to_check}
+
+Верните только JSON с полем "is_cv"."""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        try:
+            response = self._call_llm(messages, response_format={"type": "json_object"})
+            result = json.loads(response)
+            return result.get("is_cv", False)
+        except (json.JSONDecodeError, KeyError, Exception) as e:
+            logger.error(f"Error checking if content is CV: {e}")
+            # Fallback: check for common CV indicators
+            content_lower = content_to_check.lower()
+            cv_indicators = [
+                "резюме", "cv", "curriculum vitae", "опыт работы", "образование",
+                "навыки", "компетенции", "профессиональный опыт", "трудовой опыт",
+                "место работы", "должность", "компания", "университет", "институт"
+            ]
+            return any(indicator in content_lower for indicator in cv_indicators) and len(content) > 100
     
     def evaluate_requirements(
         self,
