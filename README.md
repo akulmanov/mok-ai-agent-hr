@@ -14,7 +14,7 @@ An agentic HR screening system that evaluates candidate fit against job requirem
 - **Agent Loop**: Generates clarification questions when information is unclear and can re-evaluate
 - **Evidence-Based**: Every requirement evaluation includes quoted evidence from the CV
 - **Guardrails**: Ignores protected attributes and treats inputs as data only
-- **Persistent Storage**: All data stored in SQLite (easily swappable to Postgres)
+- **Persistent Storage**: All data stored in PostgreSQL
 - **Docker Support**: Fully containerized with docker-compose
 - **Web UI**: Modern React frontend with beautiful, intuitive interface
 
@@ -75,7 +75,7 @@ curl http://localhost:8000/
 |----------|-------------|---------|
 | `OPENAI_API_KEY` | OpenAI API key (required) | - |
 | `OPENAI_MODEL` | OpenAI model to use | `gpt-4-turbo-preview` |
-| `DATABASE_URL` | Database connection string | `sqlite:///./data/hr_screening.db` |
+| `DATABASE_URL` | Database connection string | `postgresql://postgres:postgres@localhost:5432/hr_screening` |
 | `SCORING_THRESHOLD` | Score threshold for "pass" decision | `0.65` |
 | `SCORING_HOLD_BAND` | Band width for "hold" decision | `0.10` |
 | `LOG_LEVEL` | Logging level | `INFO` |
@@ -386,14 +386,12 @@ uvicorn app.main:app --reload
 
 ### Database
 
-The system uses SQLite by default. To switch to Postgres:
-
-1. Update `DATABASE_URL` in `.env`:
+The system uses PostgreSQL. The default connection string is:
 ```
-DATABASE_URL=postgresql://user:password@localhost/hr_screening
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/hr_screening
 ```
 
-2. Update `docker-compose.yml` to include a Postgres service if needed.
+When using Docker Compose, PostgreSQL is automatically set up as a service. For local development, ensure PostgreSQL is running and update the connection string in `.env` if needed.
 
 ## Logging
 

@@ -4,7 +4,7 @@ from typing import Optional
 
 class Settings(BaseSettings):
     # Database
-    database_url: str = "sqlite:///./data/hr_screening.db"
+    database_url: str = "postgresql://postgres:postgres@localhost:5432/hr_screening"
     
     # OpenAI
     openai_api_key: Optional[str] = None

@@ -8,7 +8,7 @@ Create a `.env` file in the project root:
 # Copy this content to .env file
 OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-4o
-DATABASE_URL=sqlite:///./data/hr_screening.db
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/hr_screening
 SCORING_THRESHOLD=0.65
 SCORING_HOLD_BAND=0.10
 LOG_LEVEL=INFO

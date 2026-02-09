@@ -75,7 +75,7 @@ async def startup_event():
     container_name: hr-screening-telegram-bot
     environment:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-      - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/hr_screening.db}
+      - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/hr_screening}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
     volumes:
       - ./data:/app/data
