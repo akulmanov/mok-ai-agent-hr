@@ -193,8 +193,8 @@ async def process_cv_text(update: Update, context: ContextTypes.DEFAULT_TYPE, cv
         candidate.structured_profile = profile
         db.commit()
         
-        # Проверить совместимость с вакансиями
-        await check_compatibility(update, context, candidate.id, db)
+        # Показать выбор вакансий
+        await show_position_selection(update, context, candidate.id, db)
         
     except Exception as e:
         logger.error(f"Ошибка при обработке резюме: {e}")
@@ -253,7 +253,7 @@ async def process_cv_file(
         candidate.structured_profile = profile
         db.commit()
 
-        await check_compatibility(update, context, candidate.id, db)
+        await show_position_selection(update, context, candidate.id, db)
 
     except Exception as e:
         logger.error(f"Ошибка при обработке файла: {e}")
@@ -419,8 +419,8 @@ async def find_best_matching_positions(candidate, positions: List[Position], too
         return positions[:top_n]
 
 
-async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE, candidate_id: str, db: Optional[Session] = None) -> None:
-    """Проверить совместимость кандидата с открытыми вакансиями."""
+async def show_position_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, candidate_id: str, db: Optional[Session] = None, edit_message: bool = False) -> None:
+    """Показать вакансии для выбора пользователем."""
     if db is None:
         db = SessionLocal()
         close_db = True
@@ -431,32 +431,168 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
         tools = AgentTools(db)
         candidate = tools.get_candidate(candidate_id)
         
+        # Определить user_id и способ отправки сообщения
+        if update.callback_query:
+            user_id = update.callback_query.from_user.id
+            send_func = update.callback_query.edit_message_text if edit_message else update.callback_query.message.reply_text
+        else:
+            user_id = update.effective_user.id
+            send_func = update.message.reply_text
+        
         if not candidate:
-            await update.message.reply_text("❌ Кандидат не найден.")
+            await send_func("❌ Кандидат не найден.")
             return
         
         # Найти открытые вакансии
         open_positions = db.query(Position).filter(Position.is_open == True).all()
         
         if not open_positions:
-            await update.message.reply_text(
+            msg = (
                 "✅ Ваше резюме успешно загружено!\n\n"
                 "Однако в данный момент нет открытых вакансий.\n"
                 "Используйте /positions для просмотра вакансий позже."
             )
+            await send_func(msg)
             return
         
-        # Быстрый отбор top-K позиций через embeddings (кешируется в БД внутри JSON)
-        await update.message.reply_text("⏳ Подбираю наиболее релевантные вакансии...")
+        # Получить рекомендуемые позиции через embeddings
         try:
-            positions_to_check = tools.retrieve_top_positions_for_candidate(candidate_id, top_n=5)
+            recommended = tools.retrieve_top_positions_for_candidate(candidate_id, top_n=10)
+            recommended_ids = {p.id for p in recommended}
         except Exception as e:
             logger.error(f"Ошибка при подборе релевантных вакансий: {e}")
-            positions_to_check = open_positions[:5]
+            recommended = []
+            recommended_ids = set()
         
-        await update.message.reply_text(
-            f"✅ Резюме загружено! Проверяю совместимость с {len(positions_to_check)} вакансиями...\n\n"
-            "⏳ Это может занять некоторое время..."
+        # Показать все позиции с чекбоксами
+        text = "✅ **Резюме загружено!**\n\n"
+        text += "📋 **Выберите вакансии для проверки:**\n\n"
+        
+        keyboard = []
+        selected_positions = []
+        session = get_user_session(user_id)
+        
+        if 'selected_positions' not in session:
+            session['selected_positions'] = {}
+        
+        # Показать рекомендуемые сначала
+        if recommended:
+            text += "💡 *Рекомендуемые вакансии:*\n\n"
+            for pos in recommended[:10]:
+                title = pos.structured_data.get('title', 'Без названия') if pos.structured_data else 'Без названия'
+                is_selected = session['selected_positions'].get(pos.id, False)
+                checkbox = "✅" if is_selected else "☐"
+                keyboard.append([InlineKeyboardButton(
+                    f"{checkbox} {title}",
+                    callback_data=f"toggle_pos_{pos.id}"
+                )])
+                if is_selected:
+                    selected_positions.append(pos)
+        
+        # Показать остальные
+        other_positions = [p for p in open_positions if p.id not in recommended_ids]
+        if other_positions:
+            if recommended:
+                text += "\n📋 *Другие вакансии:*\n\n"
+            for pos in other_positions[:10]:
+                title = pos.structured_data.get('title', 'Без названия') if pos.structured_data else 'Без названия'
+                is_selected = session['selected_positions'].get(pos.id, False)
+                checkbox = "✅" if is_selected else "☐"
+                keyboard.append([InlineKeyboardButton(
+                    f"{checkbox} {title}",
+                    callback_data=f"toggle_pos_{pos.id}"
+                )])
+                if is_selected:
+                    selected_positions.append(pos)
+        
+        # Кнопка "Проверить выбранные" или "Проверить рекомендуемые"
+        if selected_positions:
+            keyboard.append([InlineKeyboardButton(
+                f"✅ Проверить выбранные ({len(selected_positions)})",
+                callback_data="check_selected_positions"
+            )])
+        else:
+            keyboard.append([InlineKeyboardButton(
+                "🔍 Проверить рекомендуемые",
+                callback_data="check_recommended_positions"
+            )])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Сохранить список всех позиций в сессию
+        session['all_positions'] = {p.id: p for p in open_positions}
+        session['recommended_position_ids'] = recommended_ids
+        session['candidate_id'] = candidate_id
+        
+        if edit_message and update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await send_func(text, reply_markup=reply_markup, parse_mode='Markdown')
+        
+    except Exception as e:
+        logger.error(f"Ошибка при показе выбора вакансий: {e}")
+        if edit_message and update.callback_query:
+            await update.callback_query.edit_message_text("❌ Ошибка при загрузке вакансий.")
+        else:
+            if update.callback_query:
+                await update.callback_query.message.reply_text("❌ Ошибка при загрузке вакансий.")
+            else:
+                await update.message.reply_text("❌ Ошибка при загрузке вакансий.")
+    finally:
+        if close_db:
+            db.close()
+
+
+async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE, candidate_id: str, position_ids: Optional[List[str]] = None, db: Optional[Session] = None) -> None:
+    """Проверить совместимость кандидата с выбранными вакансиями."""
+    if db is None:
+        db = SessionLocal()
+        close_db = True
+    else:
+        close_db = False
+    
+    # Определить способ отправки сообщений (для callback query или обычного сообщения)
+    if update.callback_query:
+        user_id = update.callback_query.from_user.id
+        send_func = update.callback_query.message.reply_text
+    else:
+        user_id = update.effective_user.id
+        send_func = update.message.reply_text
+    
+    try:
+        tools = AgentTools(db)
+        candidate = tools.get_candidate(candidate_id)
+        
+        if not candidate:
+            await send_func("❌ Кандидат не найден.")
+            return
+        
+        # Если позиции не указаны, использовать рекомендуемые
+        if not position_ids:
+            try:
+                recommended = tools.retrieve_top_positions_for_candidate(candidate_id, top_n=5)
+                positions_to_check = recommended
+            except Exception as e:
+                logger.error(f"Ошибка при подборе релевантных вакансий: {e}")
+                open_positions = db.query(Position).filter(Position.is_open == True).all()
+                positions_to_check = open_positions[:5]
+        else:
+            # Получить выбранные позиции
+            positions_to_check = []
+            for pos_id in position_ids:
+                pos = db.query(Position).filter(Position.id == pos_id).first()
+                if pos:
+                    positions_to_check.append(pos)
+        
+        if not positions_to_check:
+            await send_func(
+                "❌ Не выбрано ни одной вакансии для проверки."
+            )
+            return
+        
+        await send_func(
+            f"⏳ Проверяю совместимость с {len(positions_to_check)} вакансиями...\n\n"
+            "Это может занять некоторое время..."
         )
         
         # Проверить совместимость с каждой вакансией
@@ -468,7 +604,7 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
                 screening = agent.run_autonomous_screening(
                     candidate_id=candidate_id,
                     position_id=position.id,
-                    max_iterations=3
+                    max_iterations=2  # Уменьшено, т.к. вопросы не обязательны
                 )
                 
                 matches.append({
@@ -485,48 +621,70 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
         matches.sort(key=lambda x: x['score'], reverse=True)
         
         if not matches:
-            await update.message.reply_text(
+            await send_func(
                 "✅ Проверка завершена, но результаты пока не готовы.\n\n"
                 "Используйте /stats для просмотра результатов позже."
             )
             return
         
-        # Показать результаты
-        result_text = "📊 **Результаты проверки совместимости:**\n\n"
+        # Показать результаты - группируем по решению
+        passes = [m for m in matches if m['decision'] == 'pass']
+        holds = [m for m in matches if m['decision'] == 'hold']
+        rejects = [m for m in matches if m['decision'] == 'reject']
         
-        for i, match in enumerate(matches[:3], 1):  # Показать топ-3
-            position = match['position']
-            screening = match['screening']
-            title = position.structured_data.get('title', 'Без названия') if position.structured_data else 'Без названия'
-            
-            decision_emoji = {
-                'pass': '✅',
-                'hold': '⏳',
-                'reject': '❌'
-            }.get(screening.decision, '❓')
-            
-            decision_text = {
-                'pass': 'ПОДХОДИТЕ',
-                'hold': 'НА РАССМОТРЕНИИ',
-                'reject': 'Мы свяжемся с вами позже'
-            }.get(screening.decision, 'НЕИЗВЕСТНО')
-            
-            result_text += f"{i}. {title}\n"
-            result_text += f"   {decision_emoji} {decision_text} ({screening.score*100:.1f}%)\n\n"
+        result_text = "📊 **Результаты проверки:**\n\n"
         
-        # Проверить, нужны ли уточняющие вопросы
+        # Показываем сначала успешные, потом на рассмотрении, потом отклоненные
+        if passes:
+            result_text += "✅ **Подходящие вакансии:**\n"
+            for match in passes:
+                position = match['position']
+                screening = match['screening']
+                title = position.structured_data.get('title', 'Без названия') if position.structured_data else 'Без названия'
+                result_text += f"• {title} — {screening.score*100:.0f}%\n"
+            result_text += "\n"
+        
+        if holds:
+            result_text += "⏳ **На рассмотрении:**\n"
+            for match in holds:
+                position = match['position']
+                screening = match['screening']
+                title = position.structured_data.get('title', 'Без названия') if position.structured_data else 'Без названия'
+                result_text += f"• {title} — {screening.score*100:.0f}%\n"
+            result_text += "\n"
+        
+        if rejects:
+            result_text += "📋 **Другие вакансии:**\n"
+            for match in rejects:
+                position = match['position']
+                screening = match['screening']
+                title = position.structured_data.get('title', 'Без названия') if position.structured_data else 'Без названия'
+                result_text += f"• {title} — {screening.score*100:.0f}%\n"
+            result_text += "\n"
+        
+        # Уточняющие вопросы показываем только если информация действительно отсутствует
+        # и только для лучшего совпадения
         best_match = matches[0]
         screening = best_match['screening']
         
-        if screening.clarification_questions and len(screening.clarification_questions) > 0:
-            session = get_user_session(update.effective_user.id)
+        # Проверить, есть ли действительно отсутствующая информация (не просто низкий score)
+        has_missing_info = False
+        if screening.requirement_breakdown:
+            for req in screening.requirement_breakdown:
+                # Если уверенность низкая И оценка низкая - значит информация отсутствует
+                if req.get('confidence') == 'low' and req.get('rating', 0) < 0.5:
+                    has_missing_info = True
+                    break
+        
+        if has_missing_info and screening.clarification_questions and len(screening.clarification_questions) > 0:
+            session = get_user_session(user_id)
             session['current_screening'] = screening.id
             session['pending_questions'] = screening.clarification_questions
             session['current_position_id'] = best_match['position'].id
             
-            await ask_clarification_questions(update, context, screening.clarification_questions)
+            await ask_clarification_questions(update, context, screening.clarification_questions, optional=True)
         else:
-            await update.message.reply_text(
+            await send_func(
                 result_text + "\n\n"
                 "💡 Используйте /positions для просмотра всех вакансий.\n"
                 "📊 Используйте /stats для подробной статистики.",
@@ -534,16 +692,25 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     except Exception as e:
         logger.error(f"Ошибка при проверке совместимости: {e}")
-        await update.message.reply_text("❌ Ошибка при проверке совместимости.")
+        # Определить способ отправки для ошибки
+        if update.callback_query:
+            await update.callback_query.message.reply_text("❌ Ошибка при проверке совместимости.")
+        else:
+            await update.message.reply_text("❌ Ошибка при проверке совместимости.")
+    finally:
+        if close_db:
+            db.close()
 
 
-async def ask_clarification_questions(update: Update, context: ContextTypes.DEFAULT_TYPE, questions: List[str]) -> None:
+async def ask_clarification_questions(update: Update, context: ContextTypes.DEFAULT_TYPE, questions: List[str], optional: bool = False) -> None:
     """Задать уточняющие вопросы."""
     if not questions:
         return
     
-    question_text = "❓ **Уточняющие вопросы:**\n\n"
+    question_text = "❓ **Уточняющие вопросы (необязательно):**\n\n" if optional else "❓ **Уточняющие вопросы:**\n\n"
     question_text += f"1. {questions[0]}\n\n"
+    if optional:
+        question_text += "💡 *Эти вопросы помогут уточнить информацию. Вы можете ответить на них или пропустить.*\n\n"
     question_text += "Пожалуйста, ответьте на вопрос текстом."
     
     await update.message.reply_text(question_text, parse_mode='Markdown')
@@ -551,6 +718,7 @@ async def ask_clarification_questions(update: Update, context: ContextTypes.DEFA
     # Сохранить состояние
     session = get_user_session(update.effective_user.id)
     session['current_question_index'] = 0
+    session['questions_optional'] = optional
 
 
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -598,14 +766,18 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         db.commit()
         
         # Проверить, есть ли еще вопросы
+        is_optional = session.get('questions_optional', False)
+        
         if current_index + 1 < len(questions):
             session['current_question_index'] = current_index + 1
             next_question = questions[current_index + 1]
+            optional_text = "\n💡 *Вы можете пропустить этот вопрос, если не хотите отвечать.*" if is_optional else ""
             await update.message.reply_text(
                 f"✅ Спасибо за ответ!\n\n"
                 f"❓ **Следующий вопрос:**\n\n"
                 f"{next_question}\n\n"
-                f"Пожалуйста, ответьте текстом."
+                f"Пожалуйста, ответьте текстом.{optional_text}",
+                parse_mode='Markdown'
             )
         else:
             # Все вопросы отвечены, переоценить
@@ -884,7 +1056,77 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     data = query.data
     
-    if data.startswith('position_'):
+    if data.startswith('toggle_pos_'):
+        # Переключить выбор позиции
+        position_id = data.replace('toggle_pos_', '')
+        user_id = update.effective_user.id
+        session = get_user_session(user_id)
+        
+        if 'selected_positions' not in session:
+            session['selected_positions'] = {}
+        
+        # Переключить состояние
+        current_state = session['selected_positions'].get(position_id, False)
+        session['selected_positions'][position_id] = not current_state
+        
+        # Обновить сообщение с новым состоянием
+        candidate_id = session.get('candidate_id')
+        if candidate_id:
+            await query.answer("✅" if not current_state else "☐")
+            db = SessionLocal()
+            try:
+                await show_position_selection(update, context, candidate_id, db, edit_message=True)
+            finally:
+                db.close()
+        else:
+            await query.answer("Ошибка: сессия не найдена")
+    
+    elif data == 'check_selected_positions':
+        # Проверить выбранные позиции
+        user_id = update.effective_user.id
+        session = get_user_session(user_id)
+        candidate_id = session.get('candidate_id')
+        selected = session.get('selected_positions', {})
+        
+        if not candidate_id:
+            await query.answer("Ошибка: сессия не найдена")
+            return
+        
+        selected_ids = [pos_id for pos_id, is_selected in selected.items() if is_selected]
+        
+        if not selected_ids:
+            await query.answer("Выберите хотя бы одну вакансию")
+            return
+        
+        await query.answer("Проверяю выбранные вакансии...")
+        await query.edit_message_text("⏳ Обрабатываю ваш выбор...")
+        
+        db = SessionLocal()
+        try:
+            await check_compatibility(update, context, candidate_id, selected_ids, db)
+        finally:
+            db.close()
+    
+    elif data == 'check_recommended_positions':
+        # Проверить рекомендуемые позиции (auto-select)
+        user_id = update.effective_user.id
+        session = get_user_session(user_id)
+        candidate_id = session.get('candidate_id')
+        
+        if not candidate_id:
+            await query.answer("Ошибка: сессия не найдена")
+            return
+        
+        await query.answer("Проверяю рекомендуемые вакансии...")
+        await query.edit_message_text("⏳ Обрабатываю рекомендуемые вакансии...")
+        
+        db = SessionLocal()
+        try:
+            await check_compatibility(update, context, candidate_id, None, db)  # None = auto-select
+        finally:
+            db.close()
+    
+    elif data.startswith('position_'):
         position_id = data.replace('position_', '')
         await show_position_detail(update, context, position_id)
     elif data.startswith('check_'):
@@ -899,6 +1141,32 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Проверить, является ли это ответом на вопрос
     session = get_user_session(update.effective_user.id)
     if session.get('pending_questions'):
+        # Проверить, не хочет ли пользователь пропустить вопрос (если он необязательный)
+        is_optional = session.get('questions_optional', False)
+        if is_optional and text.lower() in ['пропустить', 'skip', 'пропустить вопрос', 'не хочу отвечать']:
+            # Пропустить текущий вопрос
+            current_index = session.get('current_question_index', 0)
+            questions = session['pending_questions']
+            
+            if current_index + 1 < len(questions):
+                session['current_question_index'] = current_index + 1
+                next_question = questions[current_index + 1]
+                await update.message.reply_text(
+                    f"⏭️ Вопрос пропущен.\n\n"
+                    f"❓ **Следующий вопрос:**\n\n"
+                    f"{next_question}\n\n"
+                    f"Пожалуйста, ответьте текстом или напишите 'пропустить'.",
+                    parse_mode='Markdown'
+                )
+            else:
+                # Все вопросы пропущены или отвечены, завершить
+                await update.message.reply_text(
+                    "✅ Завершено. Используйте /stats для просмотра результатов."
+                )
+                session['pending_questions'] = []
+                session['current_question_index'] = 0
+            return
+        
         await handle_answer(update, context)
         return
     
