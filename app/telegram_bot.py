@@ -38,6 +38,16 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+def _escape_markdown(text: str) -> str:
+    """Escape special chars for Telegram Markdown (legacy) to avoid parse errors."""
+    if not text:
+        return text
+    for char in ['\\', '*', '_', '`', '[']:
+        text = text.replace(char, '\\' + char)
+    return text
+
+
 # Состояния для ConversationHandler
 WAITING_FOR_CV_TEXT, WAITING_FOR_ANSWERS, VIEWING_POSITION = range(3)
 
@@ -635,13 +645,16 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
         result_text = "📊 **Результаты проверки:**\n\n"
         
         # Показываем сначала успешные, потом на рассмотрении, потом отклоненные
+        # Экранируем названия вакансий для Markdown (иначе Telegram может выдать parse error)
+        def _title(pos):
+            t = pos.structured_data.get('title', 'Без названия') if pos.structured_data else 'Без названия'
+            return _escape_markdown(str(t))
         if passes:
             result_text += "✅ **Подходящие вакансии:**\n"
             for match in passes:
                 position = match['position']
                 screening = match['screening']
-                title = position.structured_data.get('title', 'Без названия') if position.structured_data else 'Без названия'
-                result_text += f"• {title} — {screening.score*100:.0f}%\n"
+                result_text += f"• {_title(position)} — {screening.score*100:.0f}%\n"
             result_text += "\n"
         
         if holds:
@@ -649,8 +662,7 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
             for match in holds:
                 position = match['position']
                 screening = match['screening']
-                title = position.structured_data.get('title', 'Без названия') if position.structured_data else 'Без названия'
-                result_text += f"• {title} — {screening.score*100:.0f}%\n"
+                result_text += f"• {_title(position)} — {screening.score*100:.0f}%\n"
             result_text += "\n"
         
         if rejects:
@@ -658,8 +670,7 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
             for match in rejects:
                 position = match['position']
                 screening = match['screening']
-                title = position.structured_data.get('title', 'Без названия') if position.structured_data else 'Без названия'
-                result_text += f"• {title} — {screening.score*100:.0f}%\n"
+                result_text += f"• {_title(position)} — {screening.score*100:.0f}%\n"
             result_text += "\n"
         
         # Уточняющие вопросы показываем только если информация действительно отсутствует
@@ -684,14 +695,21 @@ async def check_compatibility(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             await ask_clarification_questions(update, context, screening.clarification_questions, optional=True)
         else:
-            await send_func(
+            final_text = (
                 result_text + "\n\n"
                 "💡 Используйте /positions для просмотра всех вакансий.\n"
-                "📊 Используйте /stats для подробной статистики.",
-                parse_mode='Markdown'
+                "📊 Используйте /stats для подробной статистики."
             )
+            # Telegram limit 4096 chars
+            if len(final_text) > 4090:
+                final_text = final_text[:4080] + "\n\n..."
+            try:
+                await send_func(final_text, parse_mode='Markdown')
+            except Exception as send_err:
+                logger.warning(f"Markdown send failed, retrying without parse_mode: {send_err}")
+                await send_func(final_text)
     except Exception as e:
-        logger.error(f"Ошибка при проверке совместимости: {e}")
+        logger.error(f"Ошибка при проверке совместимости: {e}", exc_info=True)
         # Определить способ отправки для ошибки
         if update.callback_query:
             await update.callback_query.message.reply_text("❌ Ошибка при проверке совместимости.")
@@ -713,7 +731,11 @@ async def ask_clarification_questions(update: Update, context: ContextTypes.DEFA
         question_text += "💡 *Эти вопросы помогут уточнить информацию. Вы можете ответить на них или пропустить.*\n\n"
     question_text += "Пожалуйста, ответьте на вопрос текстом."
     
-    await update.message.reply_text(question_text, parse_mode='Markdown')
+    msg = update.effective_message
+    if not msg:
+        logger.error("ask_clarification_questions: no effective_message (callback_query without message?)")
+        return
+    await msg.reply_text(question_text, parse_mode='Markdown')
     
     # Сохранить состояние
     session = get_user_session(update.effective_user.id)
@@ -988,7 +1010,7 @@ async def check_position_compatibility(update: Update, context: ContextTypes.DEF
         await update.callback_query.edit_message_text(text, parse_mode='Markdown')
         
     except Exception as e:
-        logger.error(f"Ошибка при проверке совместимости: {e}")
+        logger.error(f"Ошибка при проверке совместимости: {e}", exc_info=True)
         await update.callback_query.edit_message_text("❌ Ошибка при проверке совместимости.")
     finally:
         db.close()
